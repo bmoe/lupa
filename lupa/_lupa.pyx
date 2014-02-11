@@ -88,6 +88,15 @@ cdef class LuaRuntime:
       raise an ``AttributeError``.  Note that Lua does not guarantee
       that the names will be strings.
 
+    * ``attribute_handlers``: like ``attribute_filter`` above, but 
+      handles the getting/setting itself rather than giving hints
+      to the LuaRuntime.  This must be a 2-tuple, ``(getter, setter)``
+      where ``getter`` has the signature ``func(obj, attr_name)``
+      and either returns the value for ``obj.attr_name`` or raises an
+      ``AttributeError``  The function ``setter`` has the signature
+      ``func(obj, attr_name, value)`` and may raise an ``AttributeError``.
+      The return value of the setter is unused.
+
     * ``register_eval``: should Python's ``eval()`` function be
       available to Lua code?  Note that this does not remove it from
       the builtins.  Use an ``attribute_filter`` function for that.
@@ -120,11 +129,15 @@ cdef class LuaRuntime:
     cdef bytes _encoding
     cdef bytes _source_encoding
     cdef object _attribute_filter
-    cdef bint _unpack_returned_tuples
+    cdef object _attribute_getter
+    cdef object _attribute_setter
+    cder object _unpack_returned_tuples
 
     def __cinit__(self, encoding='UTF-8', source_encoding=None,
-                  attribute_filter=None, bint register_eval=True,
-                  bint unpack_returned_tuples=False):
+                  attribute_filter=None, 
+                  attribute_handlers=None,
+                  bint unpack_returned_tuples=False, 
+                  bint register_eval=True):
         self._state = NULL
         cdef lua_State* L = lua.lua_open()
         if L is NULL:
@@ -135,6 +148,17 @@ cdef class LuaRuntime:
         self._source_encoding = source_encoding or self._encoding or b'UTF-8'
         self._attribute_filter = attribute_filter
         self._unpack_returned_tuples = unpack_returned_tuples
+
+        self._attribute_setter = self._attribute_getter = None
+        if attribute_handlers:
+            if isinstance(attribute_handlers, tuple) and len(attribute_handlers) == 2:
+                self._attribute_getter = attribute_handlers[0]
+                self._attribute_setter = attribute_handlers[1]
+            else:
+                raise LuaError("attribute_handlers must be a tuple of length 2")
+
+        if attribute_handlers and attribute_filter:
+            raise LuaError("attribute_filter and attribute_handlers are mutually exclusive")
 
         lua.luaL_openlibs(L)
         self.init_python_lib(register_eval)
@@ -1101,6 +1125,22 @@ cdef int py_object_str(lua_State* L) nogil:
     return result
 
 # item access for Python objects
+#
+# Behavior is:
+#
+#   If setting attribute_handlers flag has been set in LuaRuntime object
+#   use those handlers.
+#
+#   Else if wrapped by python.as_attrgetter() or python.as_itemgetter()
+#   from the Lua side, user getitem or getattr respsectively.
+#   
+#   Else If object has __getitem__, use that
+#
+#   Else use getattr()
+#
+#   Note that when getattr() is used, attribute_filter from LuaRuntime
+#   may mediate access.  attribute_filter does not come into play when
+#   using the getitem method of access.
 
 cdef int getitem_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n) except -1:
     return py_to_lua(runtime, L,
@@ -1113,6 +1153,9 @@ cdef int setitem_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, in
 cdef int getattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n) except -1:
     obj = <object>py_obj.obj
     attr_name = py_from_lua(runtime, L, key_n)
+    if runtime._attribute_getter is not None:
+        value = runtime._attribute_getter(obj, attr_name)
+        return py_to_lua(runtime, L, value, 1)
     if runtime._attribute_filter is not None:
         attr_name = runtime._attribute_filter(obj, attr_name, False)
     return py_to_lua(runtime, L, getattr(obj, attr_name), 1)
@@ -1120,9 +1163,13 @@ cdef int getattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, in
 cdef int setattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n, int value_n) except -1:
     obj = <object>py_obj.obj
     attr_name = py_from_lua(runtime, L, key_n)
-    if runtime._attribute_filter is not None:
-        attr_name = runtime._attribute_filter(obj, attr_name, True)
-    setattr(obj, attr_name, py_from_lua(runtime, L, value_n))
+    attr_value = py_from_lua(runtime, L, value_n)
+    if runtime._attribute_setter is not None:
+        runtime._attribute_setter(obj, attr_name, attr_value)
+    else:
+        if runtime._attribute_filter is not None:
+            attr_name = runtime._attribute_filter(obj, attr_name, True)
+        setattr(obj, attr_name, attr_value)
     return 0
 
 
@@ -1130,7 +1177,7 @@ cdef int py_object_getindex_with_gil(lua_State* L, py_object* py_obj) with gil:
     cdef LuaRuntime runtime
     try:
         runtime = <LuaRuntime?>py_obj.runtime
-        if py_obj.type_flags & OBJ_AS_INDEX:
+        if (py_obj.type_flags & OBJ_AS_INDEX) and not runtime._attribute_getter:
             return getitem_for_lua(runtime, L, py_obj, 2)
         else:
             return getattr_for_lua(runtime, L, py_obj, 2)
@@ -1153,7 +1200,7 @@ cdef int py_object_setindex_with_gil(lua_State* L, py_object* py_obj) with gil:
     cdef LuaRuntime runtime
     try:
         runtime = <LuaRuntime?>py_obj.runtime
-        if py_obj.type_flags & OBJ_AS_INDEX:
+        if (py_obj.type_flags & OBJ_AS_INDEX) and not runtime._attribute_setter:
             return setitem_for_lua(runtime, L, py_obj, 2, 3)
         else:
             return setattr_for_lua(runtime, L, py_obj, 2, 3)
