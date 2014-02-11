@@ -130,7 +130,7 @@ cdef class LuaRuntime:
     cdef object _attribute_filter
     cdef object _attribute_getter
     cdef object _attribute_setter
-    cdef object _unpack_returned_tuples
+    cdef bint _unpack_returned_tuples
 
     def __cinit__(self, encoding='UTF-8', source_encoding=None,
                   attribute_filter=None, 
